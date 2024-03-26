@@ -12,7 +12,11 @@ from typing import Optional, Tuple
 import torch
 import torch._dynamo.config
 import torch._inductor.config
-
+import numpy as np
+np.set_printoptions(threshold=np.inf)
+import os
+from transformers import AutoTokenizer, AutoModelForCausalLM
+# from benchmark import conf
 def device_sync(device):
     if "cuda" in device:
         torch.cuda.synchronize(device)
@@ -51,14 +55,26 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
     probs = torch.nn.functional.softmax(logits, dim=-1)
     return probs
 
-def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
+def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None, dataloader=None):
     probs = logits_to_probs(logits[0, -1], temperature, top_k)
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
     # input_pos: [B, S]
-    logits = model(x, input_pos)
+    # logits = model(x, input_pos)
+    for datablock in dataloader:
+        blk = datablock
+        import utils
+        utils.args.processed_token_len += blk.size(0)
+        full_cache_len = utils.args.init_blocks + utils.args.current_blocks + utils.args.local_blocks
+        print(f"Processing block {utils.args.cur_block_idx} with size {blk.size(0)}")
+        if utils.args.processed_token_len < full_cache_len:
+            blk_input_pos = torch.arange(utils.args.processed_token_len, device=x.device, dtype=torch.int)
+            # blk_input_pos = torch.arange(blk.size(0), device=x.device, dtype=torch.int)
+        else:
+            blk_input_pos = torch.arange(full_cache_len, device=x.device, dtype=torch.int)
+        logits = model(blk.view(1, -1), blk_input_pos)
     return sample(logits, **sampling_kwargs)[0]
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -162,9 +178,10 @@ def generate(
         max_seq_length = min(T_new, model.config.block_size)
 
     device, dtype = prompt.device, prompt.dtype
-    max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
+    # max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
+    max_seq_length = args.local_blocks + args.init_blocks + args.current_blocks
     with torch.device(device):
-        model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
+        model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length, args=args)
         if is_speculative and draft_model is not model:
             draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
 
@@ -175,37 +192,38 @@ def generate(
     input_pos = torch.arange(0, T, device=device)
 
     next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs)
-    if is_speculative:
-        prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
-    seq[T] = next_token
+    # if is_speculative:
+    #     prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
+    # seq[T] = next_token
 
-    input_pos = torch.tensor([T], device=device, dtype=torch.int)
-    accept_counts = [0] * (speculate_k + 1)
+    # input_pos = torch.tensor([T], device=device, dtype=torch.int)
+    # accept_counts = [0] * (speculate_k + 1)
 
-    if is_speculative:
-        input_pos = input_pos.item()  # for speculative decoding easier to keep on host
-        while input_pos < T_new - 1:
-            cur_token = next_token.view(())
+    # if is_speculative:
+    #     input_pos = input_pos.item()  # for speculative decoding easier to keep on host
+    #     while input_pos < T_new - 1:
+    #         cur_token = next_token.view(())
 
-            next_tokens = speculative_decode(
-                model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
-            )
+    #         next_tokens = speculative_decode(
+    #             model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
+    #         )
 
-            accept_counts[len(next_tokens) - 1] += 1
-            num_added = min(T_new - input_pos - 1, len(next_tokens))
-            seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
-            for i in next_tokens[: num_added,]:
-                callback(i)
-            input_pos = input_pos + num_added
-            next_token = next_tokens[-1]
-    else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
-        seq[T + 1:] = torch.cat(generated_tokens)
+    #         accept_counts[len(next_tokens) - 1] += 1
+    #         num_added = min(T_new - input_pos - 1, len(next_tokens))
+    #         seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
+    #         for i in next_tokens[: num_added,]:
+    #             callback(i)
+    #         input_pos = input_pos + num_added
+    #         next_token = next_tokens[-1]
+    # else:
+    #     generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+    #     seq[T + 1:] = torch.cat(generated_tokens)
 
-    generate_stats = {
-        'accept_counts': accept_counts
-    }
-    return seq, generate_stats
+    # generate_stats = {
+    #     'accept_counts': accept_counts
+    # }
+    # return seq, generate_stats
+    return seq[:T], {'accept_counts': 0}
 
 def encode_tokens(tokenizer, string, bos=True, device=default_device):
     tokens = tokenizer.encode(string)
@@ -263,6 +281,7 @@ def main(
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
     device=default_device,
+    dataloader=None
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -368,6 +387,7 @@ def main(
                 callback=callback,
                 temperature=temperature,
                 top_k=top_k,
+                dataloader=dataloader
             )
             aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
         if i == -1:
@@ -400,6 +420,80 @@ def main(
     print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
     print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
+class TextBlockDataLoader:
+    def __init__(self, data_dir, block_size=1024, tokenizer=None, encoding='UTF-8', device=default_device):
+        """
+        初始化数据加载器。
+
+        :param files: 文件名列表。
+        :param data_dir: 包含文件的目录路径。
+        :param block_size: 每次迭代返回的文本块的字符数量。
+        """
+        self.data_dir = data_dir
+        self.block_size = block_size
+        self.file_iter = self.file_generator()
+        self.tokenizer = tokenizer
+        self.encoding = encoding
+        self.device = device
+        self.counter = 0
+
+    def file_generator(self):
+        """
+        文件生成器，遍历所有文件。
+        """
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer is not set.")
+        
+        # read file names from the data directory
+        files = os.listdir(self.data_dir)
+        files.sort()
+        assert len(files) > 0, "No files found in the data directory." 
+
+        for filename in files:
+            file_path = os.path.join(self.data_dir, filename)
+            yield from self.file_block_reader(file_path, self.block_size)
+
+    def file_block_reader(self, filepath, block_size):
+        """
+        生成器函数，用于按块读取文件内容。
+
+        :param filepath: 要读取的文件的路径。
+        :param block_size: 每次读取的数据块大小（以字符为单位）。
+        """
+        with open(filepath, 'r', encoding=self.encoding) as file:
+            text = file.read()  # 读取整个文件内容
+
+        encoded_text = encode_tokens(self.tokenizer, text, bos=True, device=self.device)
+
+        # 分批返回固定长度的token
+        for i in range(0, encoded_text.size(0), self.block_size):
+            blk = encoded_text[i:i+self.block_size]
+            self.counter += 1
+            utils.args.cur_block_content = self.tokenizer.decode(blk.tolist())
+            utils.args.cur_block_size = block_size
+            utils.args.cur_block_idx = self.counter
+            yield blk
+        # import utils
+        # with open(filepath, 'r', encoding=self.encoding) as file:
+        #     while True:
+        #         block = file.read(block_size)
+        #         self.counter += 1
+        #         utils.args.cur_block_content = block
+        #         utils.args.cur_block_size = block_size
+        #         utils.args.cur_block_idx = self.counter
+        #         if not block:
+        #             break  # 文件结束
+        #         encoded_block = encode_tokens(self.tokenizer, block, bos=True, device=self.device)
+        #         yield encoded_block
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.file_iter)
+    
+    def set_tokenizer(self, tokenizer):
+        self.tokenizer = tokenizer
 
 if __name__ == '__main__':
     import argparse
@@ -407,21 +501,38 @@ if __name__ == '__main__':
 
     parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
-    parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
+    parser.add_argument('--num_samples', type=int, default=1, help='Number of samples.')
     parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
-    parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
+    parser.add_argument('--checkpoint_path', type=Path, default=Path("../llama/model.pth"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
-
+    parser.add_argument('--local_blocks', type=int, default=4000, help='Number of local tokens')
+    parser.add_argument('--init_blocks', type=int, default=540, help='Number of initial tokens')
+    parser.add_argument('--current_blocks', type=int, default=2000, help='Number of current tokens')
+    parser.add_argument('--output_dir', type=str, default="/llm_coder/processed_data/streamd_kv/", help='Output directory')
+    parser.add_argument('--data_dir', type=str, default="/llm_coder/3body_splited", help='Input directory, contain one or more files, if more than one, they should be named in dictionary order')
+    parser.add_argument('--cur_block_content', type=str, default=None, help='Current block content')
+    parser.add_argument('--cur_block_idx', type=int, default=0, help='Current block index')
+    parser.add_argument('--processed_token_len', type=int, default=0, help='Processed token length')
     args = parser.parse_args()
+    # init resource
+    import utils
+    utils.args = args    
+
+    # tokenizer
+    tokenizer_path = args.checkpoint_path.parent / "tokenizer.model"
+    assert tokenizer_path.is_file(), tokenizer_path
+    tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
+    # generate dataloader
+    dataloader = TextBlockDataLoader( args.data_dir, block_size=args.current_blocks, tokenizer=tokenizer, device=args.device)
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
+        args.speculate_k, args.device, dataloader
     )

@@ -65,25 +65,72 @@ transformer_configs = {
     "Mistral-7B": dict(n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=32000),
     "stories15M": dict(n_layer=6, n_head=6, dim=288),
     "stories110M": dict(n_layer=12, n_head=12, dim=768),
+    "llama": dict(n_layer=32, n_head=32, dim=4096,intermediate_size=14336,vocab_size=92544,n_local_heads=8, rope_base=1000000, block_size=32768), # interlm2_llama
 }
 
 class KVCache(nn.Module):
-    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
+    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16, args=None):
         super().__init__()
         cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
         self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.args = args
+        self.filled_buffer_size = 0
 
-    def update(self, input_pos, k_val, v_val):
+    def update(self, input_pos, k_val, v_val, layer_idx):
         # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k_val.shape[2]
+        # assert input_pos.shape[0] == k_val.shape[2] # 修改后k_val的s是一个block，但是input_pos是整个buffer的长度
 
         k_out = self.k_cache
         v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
+        init_blocks = self.args.init_blocks
+        local_blocks = self.args.local_blocks
+        current_blocks = k_val.size(2)
+        buffer_size = init_blocks + local_blocks + self.args.current_blocks # 这个buffersize是指逻辑上我们会使用的buffer大小，而不是整个buffer的大小
 
-        return k_out, v_out
+        from utils import save_kv_to_file, args, save_block_to_file
+        save_kv_to_file(k_val, v_val, args.output_dir, f'layer_{layer_idx}_block_{args.cur_block_idx}_k.pt', f'layer_{layer_idx}_block_{args.cur_block_idx}_v.pt')
+        save_block_to_file(args.cur_block_content, args.output_dir, f'layer_{layer_idx}_block_{args.cur_block_idx}_content.pt')
+        
+        # TODO 这里的逻辑有问题，需要重新设计，并且加上mask的处理
+
+        # 3 cases: init_blocks not filled, local_blocks not filled, streaming
+        
+        if self.filled_buffer_size < init_blocks:
+            reserve_pos = torch.arange(self.filled_buffer_size, self.filled_buffer_size+current_blocks, device=input_pos.device)
+            # fill init_blocks
+            k_out[:, :, reserve_pos] = k_val
+            v_out[:, :, reserve_pos] = v_val
+            self.filled_buffer_size += current_blocks
+            return k_out[:,:,:self.filled_buffer_size], v_out[:,:,:self.filled_buffer_size]#, mask[:,:,:,:self.filled_buffer_size]
+
+        elif(self.filled_buffer_size < init_blocks+local_blocks):
+            # fill local_blocks
+            reserve_pos = torch.arange(self.filled_buffer_size, self.filled_buffer_size+current_blocks, device=input_pos.device)
+            k_out[:, :, reserve_pos] = k_val
+            v_out[:, :, reserve_pos] = v_val
+            self.filled_buffer_size += current_blocks
+            return k_out[:,:,:self.filled_buffer_size], v_out[:,:,:self.filled_buffer_size]#, mask[:,:,:,:self.filled_buffer_size]
+
+        else:
+            # mv target to reserve
+            reserve_pos = torch.arange(init_blocks, init_blocks+local_blocks, device=input_pos.device)
+            target_pos = torch.arange(init_blocks+current_blocks, init_blocks+current_blocks+local_blocks, device=input_pos.device)
+            k_out[:, :, reserve_pos] = k_out[:, :, target_pos]
+            v_out[:, :, reserve_pos] = v_out[:, :, target_pos]
+            # mv new to current
+            new_pos = torch.arange(init_blocks+local_blocks , init_blocks+local_blocks+current_blocks, device=input_pos.device)
+            k_out[:, :, new_pos] = k_val
+            v_out[:, :, new_pos] = v_val
+            if self.filled_buffer_size + current_blocks < buffer_size:
+                self.filled_buffer_size += current_blocks
+            else:
+                self.filled_buffer_size = buffer_size
+
+            # k_out[:, :, input_pos] = k_val
+            # v_out[:, :, input_pos] = v_val
+
+            return k_out[:,:,:self.filled_buffer_size], v_out[:,:,:self.filled_buffer_size]#, mask[:,:,:,:self.filled_buffer_size]
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
@@ -100,7 +147,7 @@ class Transformer(nn.Module):
         self.max_batch_size = -1
         self.max_seq_length = -1
 
-    def setup_caches(self, max_batch_size, max_seq_length):
+    def setup_caches(self, max_batch_size, max_seq_length, args=None):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
         head_dim = self.config.dim // self.config.n_head
@@ -108,19 +155,19 @@ class Transformer(nn.Module):
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim)
+            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, args=args)
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
-        mask = self.causal_mask[None, None, input_pos]
+        mask = self.causal_mask[None, None, input_pos.size(0)-idx.size(1):input_pos.size(0), input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
         for i, layer in enumerate(self.layers):
-            x = layer(x, input_pos, freqs_cis, mask)
+            x = layer(x, input_pos, freqs_cis, mask, i)
         x = self.norm(x)
         logits = self.output(x)
         return logits
@@ -138,8 +185,8 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
-    def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+    def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor, layer_idx: int) -> Tensor:
+        h = x + self.attention(self.attention_norm(x), freqs_cis=freqs_cis, mask=mask, layer_idx=layer_idx, input_pos=input_pos)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -168,26 +215,36 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, layer_idx, input_pos: Optional[Tensor] = None) -> Tensor:
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
         q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
 
+        # bsz, seqlen, n_head, head_dim
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
-        q = apply_rotary_emb(q, freqs_cis)
-        k = apply_rotary_emb(k, freqs_cis)
-
+        # (bsz, n_head, seqlen, head_dim) -> (bsz, seqlen, n_head, head_dim)
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
         if self.kv_cache is not None:
-            k, v = self.kv_cache.update(input_pos, k, v)
+            k, v = self.kv_cache.update(input_pos, k, v, layer_idx)
+            
+        # TODO 原版的位置编码是在cache之前的，但是cache需要存没有位置编码的k和v，所以调整到后面
+        # 因为cache前转置了一下，所以需要转置回来加上位置编码再转置回去； 暂时先凑合，之后再改
+        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+        q = apply_rotary_emb(q, freqs_cis[input_pos[:seqlen]])
+        k = apply_rotary_emb(k, freqs_cis)
+        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
-        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+
+
+        # [B, H, S, D], dim 1 is local heads
+        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1) 
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
