@@ -235,7 +235,7 @@ class Attention(nn.Module):
         # TODO 原版的位置编码是在cache之前的，但是cache需要存没有位置编码的k和v，所以调整到后面
         # 因为cache前转置了一下，所以需要转置回来加上位置编码再转置回去； 暂时先凑合，之后再改
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
-        q = apply_rotary_emb(q, freqs_cis[input_pos[:seqlen]])
+        q = apply_rotary_emb(q, freqs_cis[input_pos[-seqlen:]])
         k = apply_rotary_emb(k, freqs_cis)
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
